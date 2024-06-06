@@ -1,0 +1,690 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+
+class Program
+{
+    public static int selectedRow = 0;
+    public static int selectedCol = 0;
+    static bool pieceSelected = false;
+    static string fromSquare = "";
+
+    static GameBoard gameBoard = new GameBoard();
+    static TcpListener? server = null;
+    static TcpClient? client = null;
+    static NetworkStream? stream = null;
+    static GameState gameState = new GameState();
+    static char serverColor;
+    static char clientColor;
+    static object lockObject = new object();
+
+    static void Main(string[] args)
+    {
+        gameBoard.PrintBoardWithCoordinates();
+
+        Console.WriteLine("Enter 's' to start as server or 'c' to connect as client:");
+        string input = Console.ReadLine() ?? "";
+        char choice = input.Length > 0 ? input[0] : ' ';
+
+        if (choice == 's')
+        {
+            StartServer();
+        }
+        else if (choice == 'c')
+        {
+            StartClient();
+        }
+
+        Console.ReadLine();
+    }
+
+    static void StartServer()
+    {
+        try
+        {
+            server = new TcpListener(IPAddress.Any, 1234);
+            server.Start();
+            Console.WriteLine("Waiting for client...");
+            client = server.AcceptTcpClient();
+            if (client != null)
+            {
+                stream = client.GetStream();
+            }
+            Console.WriteLine("Client connected.");
+
+            Random rand = new Random();
+            serverColor = rand.Next(2) == 0 ? 'w' : 'b';
+            clientColor = serverColor == 'w' ? 'b' : 'w';
+            Console.WriteLine($"Server plays as {(serverColor == 'w' ? "White" : "Black")}");
+
+            // Send server color to client
+            SendMessage(new byte[] { (byte)serverColor });
+
+            Thread receiveThread = new Thread(ReceiveMessages);
+            receiveThread.Start();
+            PlayGame(serverColor);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+    }
+
+    static void StartClient()
+    {
+        while (true)
+        {
+            try
+            {
+                Console.Write("Enter server IP: ");
+                string? serverIP = Console.ReadLine();
+                if (string.IsNullOrEmpty(serverIP))
+                {
+                    Console.WriteLine("Invalid server IP.");
+                    continue;
+                }
+
+                client = new TcpClient(serverIP, 1234);
+                if (client != null)
+                {
+                    stream = client.GetStream();
+                }
+                Console.WriteLine("Connected to server.");
+
+                // Receive server color
+                char receivedServerColor = (char)ReceiveMessage(1)[0];
+                serverColor = receivedServerColor;
+                clientColor = serverColor == 'w' ? 'b' : 'w';
+                Console.WriteLine($"Client plays as {(clientColor == 'w' ? "White" : "Black")}");
+
+                Thread receiveThread = new Thread(ReceiveMessages);
+                receiveThread.Start();
+                PlayGame(clientColor);
+                break; // Exit loop if connected
+            }
+            catch (SocketException)
+            {
+                Console.WriteLine("Connection failed. Trying to reconnect...");
+                Thread.Sleep(5000); // Wait for 5 seconds before trying again
+            }
+        }
+    }
+
+    static void PlayGame(char player)
+    {
+        while (!gameState.GameOver)
+        {
+            if (gameState.CurrentPlayer == player)
+            {
+                gameBoard.PrintBoardWithCoordinates();
+                Console.WriteLine($"{(player == 'w' ? "White" : "Black")}'s turn.");
+                Console.WriteLine("Enter move (e.g., 'a3 to b4') or use arrow keys and space to move:");
+
+                if (Console.KeyAvailable)
+                {
+                    var keyInfo = Console.ReadKey(intercept: true);
+
+                    switch (keyInfo.Key)
+                    {
+                        case ConsoleKey.UpArrow:
+                            if (selectedRow > 0) selectedRow--;
+                            break;
+                        case ConsoleKey.DownArrow:
+                            if (selectedRow < 7) selectedRow++;
+                            break;
+                        case ConsoleKey.LeftArrow:
+                            if (selectedCol > 0) selectedCol--;
+                            break;
+                        case ConsoleKey.RightArrow:
+                            if (selectedCol < 7) selectedCol++;
+                            break;
+                        case ConsoleKey.Spacebar:
+                            if (HandleSpacebarPress(player))
+                            {
+                                gameBoard.PrintBoardWithCoordinates();
+                                CheckGameOver();
+                            }
+                            break;
+                        case ConsoleKey.Enter:
+                            string move = Console.ReadLine() ?? "";
+                            string[] moveParts = move.Split(" to ");
+                            if (moveParts.Length == 2 && gameBoard.IsValidMove(moveParts[0], moveParts[1], player))
+                            {
+                                if (gameBoard.ExecuteMove(moveParts[0], moveParts[1], player))
+                                {
+                                    // If a piece was captured, check for further captures
+                                    while (gameBoard.HasCaptureMoveFromSquare(moveParts[1], player))
+                                    {
+                                        gameBoard.PrintBoardWithCoordinates();
+                                        Console.WriteLine("You can make another capture. Enter your next move:");
+                                        move = Console.ReadLine() ?? "";
+                                        moveParts = move.Split(" to ");
+                                        if (moveParts.Length == 2 && gameBoard.IsValidMove(moveParts[0], moveParts[1], player))
+                                        {
+                                            gameBoard.ExecuteMove(moveParts[0], moveParts[1], player);
+                                        }
+                                        else
+                                        {
+                                            Console.WriteLine("Invalid move. Try again.");
+                                        }
+                                    }
+                                }
+                                SendGameState();
+                                gameState.SwitchPlayer();
+                                gameBoard.PrintBoardWithCoordinates();
+                                CheckGameOver();
+                            }
+                            else
+                            {
+                                Console.WriteLine("Invalid move. Try again.");
+                            }
+                            break;
+                    }
+
+                    gameBoard.PrintBoardWithCoordinates();
+                }
+
+                Thread.Sleep(100); // Reduce CPU usage
+            }
+            else
+            {
+                if (!gameState.WaitingForPlayerMessageDisplayed)
+                {
+                    Console.WriteLine("Not your turn, waiting for the other player...");
+                    gameState.WaitingForPlayerMessageDisplayed = true;
+                }
+                Thread.Sleep(100); // Reduce CPU usage
+            }
+        }
+    }
+
+    static bool HandleSpacebarPress(char player)
+    {
+        if (!pieceSelected)
+        {
+            fromSquare = $"{(char)(selectedCol + 'a')}{8 - selectedRow}";
+            if (gameBoard.Board[selectedRow, selectedCol] == player || char.ToUpper(gameBoard.Board[selectedRow, selectedCol]) == player)
+            {
+                pieceSelected = true;
+            }
+        }
+        else
+        {
+            string toSquare = $"{(char)(selectedCol + 'a')}{8 - selectedRow}";
+            if (gameBoard.IsValidMove(fromSquare, toSquare, player))
+            {
+                if (gameBoard.ExecuteMove(fromSquare, toSquare, player))
+                {
+                    SendGameState();
+                    // If a piece was captured, check for further captures
+                    while (gameBoard.HasCaptureMoveFromSquare(toSquare, player))
+                    {
+                        gameBoard.PrintBoardWithCoordinates();
+                        Console.WriteLine("You can make another capture. Enter your next move:");
+                        fromSquare = toSquare;
+                        toSquare = Console.ReadLine() ?? "";
+                        if (gameBoard.IsValidMove(fromSquare, toSquare, player))
+                        {
+                            gameBoard.ExecuteMove(fromSquare, toSquare, player);
+                            SendGameState();
+                        }
+                        else
+                        {
+                            Console.WriteLine("Invalid move. Try again.");
+                            break;
+                        }
+                    }
+                    gameState.SwitchPlayer();
+                    gameBoard.PrintBoardWithCoordinates();
+                    CheckGameOver();
+                    pieceSelected = false; // Reset piece selection
+                    return true; // Move completed
+                }
+            }
+            else
+            {
+                Console.WriteLine("Invalid move. Try again.");
+            }
+            pieceSelected = false;
+        }
+        return false; // Move not completed
+    }
+
+    static void SendGameState()
+    {
+        lock (lockObject)
+        {
+            if (stream != null)
+            {
+                StringBuilder gameStateBuilder = new StringBuilder();
+                for (int row = 0; row < 8; row++)
+                {
+                    for (int col = 0; col < 8; col++)
+                    {
+                        gameStateBuilder.Append(gameBoard.Board[row, col]);
+                    }
+                }
+                gameStateBuilder.Append('|'); // Separator
+                gameStateBuilder.Append(gameState.CurrentPlayer); // Append current player turn
+                byte[] message = Encoding.ASCII.GetBytes(gameStateBuilder.ToString());
+                Console.WriteLine($"Sending game state: {gameStateBuilder.ToString()}"); // Debug
+                stream.Write(message, 0, message.Length);
+            }
+        }
+    }
+
+    static void ReceiveMessages()
+    {
+        byte[] buffer = new byte[1024];
+        while (!gameState.GameOver)
+        {
+            try
+            {
+                lock (lockObject)
+                {
+                    if (stream != null)
+                    {
+                        int bytesRead = stream.Read(buffer, 0, buffer.Length);
+                        if (bytesRead == 0) throw new Exception("Client disconnected");
+
+                        string command = Encoding.ASCII.GetString(buffer, 0, bytesRead);
+                        Console.WriteLine($"Received command: {command}"); // Debug
+                        ProcessCommand(command);
+                    }
+                }
+            }
+            catch (SocketException ex)
+            {
+                Console.WriteLine("Socket error: " + ex.Message);
+                ReconnectClient();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("General error: " + ex.Message);
+                ReconnectClient();
+            }
+        }
+    }
+
+    static void ReconnectClient()
+    {
+        try
+        {
+            client?.Close(); // Close the existing client connection if any
+
+            Console.WriteLine("Waiting for client to reconnect...");
+            client = server?.AcceptTcpClient(); // Wait for a new client connection
+            if (client != null)
+            {
+                stream = client.GetStream();
+                Console.WriteLine("Client reconnected.");
+
+                SendGameState(); // Send the current game state to the reconnected client
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to reconnect client: {ex.Message}");
+        }
+    }
+
+    static void ProcessCommand(string command)
+    {
+        string[] parts = command.Split('|');
+        if (parts.Length == 2)
+        {
+            string boardState = parts[0];
+            char currentPlayer = parts[1][0];
+
+            lock (gameState)
+            {
+                gameBoard.UpdateBoard(boardState);
+                gameState.CurrentPlayer = currentPlayer;
+                Console.WriteLine($"Updated current player to: {gameState.CurrentPlayer}"); // Debug
+            }
+
+            Console.WriteLine($"Processed board state: {boardState}"); // Debug
+            gameBoard.PrintBoardWithCoordinates();
+            CheckGameOver();
+        }
+    }
+
+    static void CheckGameOver()
+    {
+        if (!gameBoard.HasValidMoves(gameState.CurrentPlayer))
+        {
+            lock (gameState)
+            {
+                gameState.GameOver = true;
+            }
+            Console.WriteLine($"{(gameState.CurrentPlayer == 'w' ? "White" : "Black")} has no valid moves or no pieces remaining. Game over!");
+        }
+    }
+
+    static void SendMessage(byte[] message)
+    {
+        lock (lockObject)
+        {
+            stream?.Write(message, 0, message.Length);
+        }
+    }
+
+    static byte[] ReceiveMessage(int length)
+    {
+        lock (lockObject)
+        {
+            if (stream != null)
+            {
+                byte[] buffer = new byte[length];
+                stream.Read(buffer, 0, length);
+                return buffer;
+            }
+        }
+        return Array.Empty<byte>();
+    }
+}
+
+public class GameState
+{
+    public char CurrentPlayer { get; set; } = 'w';
+    public bool GameOver { get; set; } = false;
+    public bool WaitingForPlayerMessageDisplayed { get; set; } = false;
+
+    public void SwitchPlayer()
+    {
+        CurrentPlayer = CurrentPlayer == 'w' ? 'b' : 'w';
+        WaitingForPlayerMessageDisplayed = false; // Reset the flag when switching player
+        Console.WriteLine($"SwitchPlayer: Now it's {CurrentPlayer}'s turn."); // Debug
+    }
+}
+
+public class GameBoard
+{
+    public char[,] Board { get; private set; } = new char[8, 8];
+
+    public GameBoard()
+    {
+        InitializeBoard();
+    }
+
+    public void InitializeBoard()
+    {
+        for (int row = 0; row < 8; row++)
+        {
+            for (int col = 0; col < 8; col++)
+            {
+                if ((row + col) % 2 != 0)
+                {
+                    if (row < 3)
+                        Board[row, col] = 'w'; // White pieces
+                    else if (row > 4)
+                        Board[row, col] = 'b'; // Black pieces
+                    else
+                        Board[row, col] = ' '; // Empty space
+                }
+                else
+                {
+                    Board[row, col] = ' '; // Unusable squares
+                }
+            }
+        }
+    }
+
+    public void PrintBoardWithCoordinates()
+    {
+        Console.Clear();
+        Console.WriteLine("  a b c d e f g h");
+        for (int row = 0; row < 8; row++)
+        {
+            Console.Write(8 - row + " ");
+            for (int col = 0; col < 8; col++)
+            {
+                Console.BackgroundColor = ((row + col) % 2 != 0) ? ConsoleColor.DarkGray : ConsoleColor.Gray;
+                if (row == Program.selectedRow && col == Program.selectedCol)
+                {
+                    Console.BackgroundColor = ConsoleColor.Green;
+                }
+                Console.ForegroundColor = ConsoleColor.White;
+                Console.Write(Board[row, col] + " ");
+                Console.ResetColor();
+            }
+            Console.WriteLine();
+        }
+    }
+
+    public void UpdateBoard(string boardState)
+    {
+        int index = 0;
+        for (int row = 0; row < 8; row++)
+        {
+            for (int col = 0; col < 8; col++)
+            {
+                Board[row, col] = boardState[index++];
+            }
+        }
+    }
+
+    public bool IsValidMove(string fromSquare, string toSquare, char player)
+    {
+        int fromCol = fromSquare[0] - 'a';
+        int fromRow = 8 - int.Parse(fromSquare[1].ToString());
+        int toCol = toSquare[0] - 'a';
+        int toRow = 8 - int.Parse(toSquare[1].ToString());
+
+        // Check bounds
+        if (fromCol < 0 || fromCol >= 8 || fromRow < 0 || fromRow >= 8 ||
+            toCol < 0 || toCol >= 8 || toRow < 0 || toRow >= 8)
+            return false;
+
+        // Check if the move is diagonal and the target square is empty
+        if (Math.Abs(fromCol - toCol) == Math.Abs(fromRow - toRow))
+        {
+            if (Board[toRow, toCol] == ' ')
+            {
+                // Single move forward
+                if (Math.Abs(fromRow - toRow) == 1)
+                {
+                    if (player == 'w' && toRow > fromRow) return true; // White moves down
+                    if (player == 'b' && toRow < fromRow) return true; // Black moves up
+                    if (char.IsUpper(Board[fromRow, fromCol])) return true; // Kings move in both directions
+                }
+                // Capture move
+                else if (Math.Abs(fromRow - toRow) == 2)
+                {
+                    int midRow = (fromRow + toRow) / 2;
+                    int midCol = (fromCol + toCol) / 2;
+                    char opponent = (player == 'w') ? 'b' : 'w';
+                    if (Board[midRow, midCol] == opponent || char.ToUpper(Board[midRow, midCol]) == opponent)
+                    {
+                        Board[midRow, midCol] = ' '; // Remove captured piece
+                        return true;
+                    }
+                }
+                // King move (multi-square diagonal)
+                else if (char.IsUpper(Board[fromRow, fromCol]))
+                {
+                    int rowIncrement = (toRow - fromRow) / Math.Abs(toRow - fromRow);
+                    int colIncrement = (toCol - fromCol) / Math.Abs(toCol - fromCol);
+                    for (int i = 1; i < Math.Abs(toRow - fromRow); i++)
+                    {
+                        if (Board[fromRow + i * rowIncrement, fromCol + i * colIncrement] != ' ')
+                            return false; // Path is blocked
+                    }
+                    return true;
+                }
+            }
+        }
+
+        // Check if a capture move is mandatory
+        if (HasCaptureMove(player))
+        {
+            return IsCaptureMove(fromSquare, toSquare, player);
+        }
+
+        return false;
+    }
+
+    public bool ExecuteMove(string fromSquare, string toSquare, char player)
+    {
+        int fromCol = fromSquare[0] - 'a';
+        int fromRow = 8 - int.Parse(fromSquare[1].ToString());
+        int toCol = toSquare[0] - 'a';
+        int toRow = 8 - int.Parse(toSquare[1].ToString());
+
+        bool pieceCaptured = false;
+        if (Math.Abs(fromRow - toRow) == 2)
+        {
+            int midRow = (fromRow + toRow) / 2;
+            int midCol = (fromCol + toCol) / 2;
+            Board[midRow, midCol] = ' '; // Remove captured piece
+            pieceCaptured = true;
+        }
+        Board[toRow, toCol] = Board[fromRow, fromCol];
+        Board[fromRow, fromCol] = ' ';
+
+        // Handle captures along the way for kings
+        if (char.IsUpper(Board[toRow, toCol]))
+        {
+            int rowIncrement = (toRow - fromRow) / Math.Abs(toRow - fromRow);
+            int colIncrement = (toCol - fromCol) / Math.Abs(toCol - fromCol);
+            for (int i = 1; i < Math.Abs(toRow - fromRow); i++)
+            {
+                int midRow = fromRow + i * rowIncrement;
+                int midCol = fromCol + i * colIncrement;
+                char opponent = (player == 'w') ? 'b' : 'w';
+                if (Board[midRow, midCol] == opponent || char.ToUpper(Board[midRow, midCol]) == opponent)
+                {
+                    Board[midRow, midCol] = ' '; // Remove captured piece
+                    pieceCaptured = true;
+                }
+            }
+        }
+
+        // Convert to king if reaching the opposite end
+        if ((player == 'w' && toRow == 7) || (player == 'b' && toRow == 0))
+        {
+            Board[toRow, toCol] = Char.ToUpper(player); // 'W' or 'B'
+        }
+
+        return pieceCaptured;
+    }
+
+    public bool CanMoveOrCapture(int fromRow, int fromCol, char player)
+    {
+        int[] moveRow = new int[] { 1, -1 };
+        int[] moveCol = new int[] { 1, -1 };
+
+        foreach (int r in moveRow)
+        {
+            foreach (int c in moveCol)
+            {
+                int toRow = fromRow + r;
+                int toCol = fromCol + c;
+
+                // Check single move
+                if (IsValidCoordinate(toRow, toCol) && Board[toRow, toCol] == ' ')
+                {
+                    if (player == 'w' && r == 1) return true;
+                    if (player == 'b' && r == -1) return true;
+                    if (char.IsUpper(Board[fromRow, fromCol])) return true; // Kings move in both directions
+                }
+
+                // Check capture move
+                toRow += r;
+                toCol += c;
+                if (IsValidCoordinate(toRow, toCol) && Board[toRow, toCol] == ' ')
+                {
+                    int midRow = fromRow + r;
+                    int midCol = fromCol + c;
+                    if (Board[midRow, midCol] != ' ' && Board[midRow, midCol] != player)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool IsValidCoordinate(int row, int col)
+    {
+        return row >= 0 && row < 8 && col >= 0 && col < 8;
+    }
+
+    public bool HasValidMoves(char player)
+    {
+        for (int row = 0; row < 8; row++)
+        {
+            for (int col = 0; col < 8; col++)
+            {
+                char piece = Board[row, col];
+                if (piece == player || char.ToUpper(piece) == player)
+                {
+                    if (CanMoveOrCapture(row, col, player))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    public bool HasCaptureMove(char player)
+    {
+        for (int row = 0; row < 8; row++)
+        {
+            for (int col = 0; col < 8; col++)
+            {
+                if (Board[row, col] == player || char.ToUpper(Board[row, col]) == player)
+                {
+                    int[] directions = { -2, 2 };
+                    foreach (int dRow in directions)
+                    {
+                        foreach (int dCol in directions)
+                        {
+                            int targetRow = row + dRow;
+                            int targetCol = col + dCol;
+                            if (IsValidCoordinate(targetRow, targetCol) && IsCaptureMove($"{(char)(col + 'a')}{8 - row}", $"{(char)(targetCol + 'a')}{8 - targetRow}", player))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    public bool HasCaptureMoveFromSquare(string fromSquare, char player)
+    {
+        int fromCol = fromSquare[0] - 'a';
+        int fromRow = 8 - int.Parse(fromSquare[1].ToString());
+
+        return CanMoveOrCapture(fromRow, fromCol, player);
+    }
+
+    private bool IsCaptureMove(string fromSquare, string toSquare, char player)
+    {
+        int fromCol = fromSquare[0] - 'a';
+        int fromRow = 8 - int.Parse(fromSquare[1].ToString());
+        int toCol = toSquare[0] - 'a';
+        int toRow = 8 - int.Parse(toSquare[1].ToString());
+
+        if (Math.Abs(fromCol - toCol) == 2 && Math.Abs(fromRow - toRow) == 2)
+        {
+            int midRow = (fromRow + toRow) / 2;
+            int midCol = (fromCol + toCol) / 2;
+            char opponent = (player == 'w') ? 'b' : 'w';
+            if (Board[midRow, midCol] == opponent || char.ToUpper(Board[midRow, midCol]) == opponent)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+}
